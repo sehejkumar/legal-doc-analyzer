@@ -69,3 +69,53 @@ this prevents errors on restart and avoids duplication of data
 '''
 
 collection = client.get_or_create_collection("documents")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 3: PDF text extraction
+# ─────────────────────────────────────────────────────────────────────────────
+
+def extract_text_from_pdf(file_path:str) -> str:
+    '''
+    Opens a PDF and returns all its text as a single string
+
+    Why pdfplumber instead of PyPDF2 or pdfminer?
+    pdfplumber is built on top of pdfminer but adds smarter text extractions
+    It handles: multi-column layouts (common in legal contracts), tables(extracts
+    them in reading order), preserved whitespace better than PyPDF2
+    For legal documents with complex formatting, pdfplumber is the most reliable
+    free option.
+
+    PARAMETER:
+      file_path: str  →  the path to the PDF on disk
+                         (FastAPI will save uploaded files to a temp path)
+
+    RETURNS:
+      A single string with all text from all pages, separated by newlines.
+    '''
+
+    # We'll build up text page by page and join at the end.
+    # Joining a list of strings with join() is much faster than using += in a loop.
+    # (In Python, strings are immutable — every += creates a new string object.)
+    allText = []
+
+    # pdfplumber.open() is a context manager (the "with" keyword).
+    # This ensures the file is properly closed even if an error occurs inside.
+    # Same pattern as open() for regular files.
+
+    with pdfplumber.open(file_path) as currPDF:
+        # pdf.pages is a list of Page objects, one per page in the document.
+        for currPage in currPDF.pages:
+            # page.extract_text() reads all text from that page.
+            # It returns None if the page has no extractable text (e.g. a scanned image).
+            # The "or ''" handles that None case — if extract_text() returns None,
+            # we use an empty string instead, avoiding a crash when we call .strip().
+            currPageText = currPage.extract_text() or ""
+            # .strip() removes leading/trailing whitespace and blank lines.
+            # We only append if there's actual content (the "if text" check).
+            if currPageText.strip():
+                allText.append(currPageText.strip())
+    
+    # "\n\n" between pages creates a clear visual boundary in the combined text.
+    # This matters for chunking — a double newline between pages prevents sentences
+    # from accidentally merging across page boundaries.
+    return "\n\n".join(allText)
