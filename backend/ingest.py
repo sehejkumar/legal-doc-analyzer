@@ -74,7 +74,7 @@ collection = client.get_or_create_collection("documents")
 # SECTION 3: PDF text extraction
 # ─────────────────────────────────────────────────────────────────────────────
 
-def extract_text_from_pdf(file_path:str) -> str:
+def extractTextFromPDF(file_path:str) -> str:
     '''
     Opens a PDF and returns all its text as a single string
 
@@ -119,3 +119,159 @@ def extract_text_from_pdf(file_path:str) -> str:
     # This matters for chunking — a double newline between pages prevents sentences
     # from accidentally merging across page boundaries.
     return "\n\n".join(allText)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 4: Chunking
+# ─────────────────────────────────────────────────────────────────────────────
+
+def chunkText(text: str, chunkSize: int=500, overlap: int = 50) -> list[str]:
+    """
+    Splits a long string of text into overlapping chunks of approximately
+    chunk_size words each.
+
+    
+    WHY WE CHUNK:
+    1. Vector precision: a single embedding for an entire 40-page contract is useless.
+       It averages everything into one undifferentiated blob. Individual chunks keep
+       ideas focused and retrievable.
+    2. LLM context limits: we can only pass so many tokens to the LLM at once.
+       Retrieving 4 targeted chunks (~2000 words) is far more effective than
+       trying to pass the whole document.
+
+    WHY WORD-BASED, NOT CHARACTER OR TOKEN-BASED:
+    Word boundaries are natural semantic units. Splitting by character count can
+    cut words in half. Splitting by tokens requires running a tokenizer first
+    (more complexity). Word-count is a good practical approximation.
+
+    PARAMETERS:
+      text       : str  →  the full document text
+      chunk_size : int  →  target number of words per chunk (default 500)
+      overlap    : int  →  number of words to repeat between adjacent chunks (default 50)
+
+    RETURNS:
+      A list of strings, each being one chunk of text.
+    """
+
+    # Split the entire text into individual words.
+    # .split() with no argument splits on any whitespace (spaces, tabs, newlines)
+    # and automatically ignores consecutive whitespace. Clean and simple.
+    words = text.split()
+    chunks=[]
+
+    # We step through the word list using a sliding window.
+    # Start at word 0, then jump forward by (chunk_size - overlap) each iteration.
+    # The step is (chunk_size - overlap) NOT chunk_size, because we want consecutive
+    # chunks to share `overlap` words.
+
+    # Example with chunk_size=10, overlap=3:
+    #   Chunk 1: words[0:10]   → words 0-9
+    #   Chunk 2: words[7:17]   → words 7-16  (shares words 7,8,9 with chunk 1)
+    #   Chunk 3: words[14:24]  → words 14-23 (shares words 14,15,16 with chunk 2)
+    step= chunkSize - overlap
+
+    for i in range(0, len(words), step):
+        # Slice words from position i to i+chunk_size.
+        # If i+chunk_size goes past the end of the list, Python just returns
+        # whatever's left — no index error. This handles the last chunk cleanly.
+        chunkWords = words[i:i+chunkSize]
+        # Re-join the words back into a readable string.
+        chunk = " ".join(chunkWords)
+        chunks.append(chunk)
+
+        # Stop condition: if we've reached (or passed) the end of the word list,
+        # there's nothing more to chunk. Without this, the range() loop would
+        # keep running with empty slices.
+        if i + chunkSize >= len(words):
+            break
+    return chunks
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 5: Embedding + Storage (the main entry point)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def ingestPDF (filePath: str, docID: str) -> dict:
+    """
+    Full pipeline: extract text → chunk → embed → store in ChromaDB.
+    This is the function that FastAPI will call when a user uploads a PDF.
+
+    PARAMETERS:
+      filePath : str  →  path to the saved PDF on disk
+      docID    : str  →  a unique identifier for this document
+                          (we'll use the filename, e.g. "contract_2024.pdf")
+                          Used to namespace chunks so we can delete or filter
+                          by document later.
+    RETURNS:
+      A dict with metadata about what was ingested (useful for API responses).
+    """
+
+    #Step 1: Extract
+    print(f"[ingest] Extracting text from {filePath}...")
+    text = extractTextFromPDF(filePath)
+    # Guard: if pdfplumber extracted nothing (scanned image PDF with no text layer),
+    # raise a clear error rather than silently storing empty chunks.
+    if not text.strip():
+        raise ValueError(
+            "No text could be extracted from this PDF. "
+            "It may be a scanned document without a text layer. "
+            "OCR support is not yet implemented."
+        )
+    
+    #Step 2: Chunk
+    print("[ingest] Chunking text...")
+    chunks = chunkText(text)
+    print(f"[ingest] Created {len(chunks)} chunks.")
+
+    #Step 3: Embed
+    # model.encode() takes a list of strings and returns a numpy array of shape
+    # (num_chunks, 384). Each row is the 384-dimensional embedding for one chunk.
+    # show_progress_bar=True prints a tqdm progress bar to the terminal.
+    # For a large document with 100+ chunks, this gives you visibility.
+     # convert_to_list=True converts the numpy array to a plain Python list.
+    # ChromaDB expects Python lists, not numpy arrays.
+    print("[ingest] Generating embeddings...")
+    embeddings = model.encode(chunks,show_progress_bar=True, convert_to_list=True)
+
+    #Step 4: Build metadata
+    # ChromaDB lets you attach arbitrary metadata to each stored item.
+    # We store:
+    #   - "doc_id"    : which document this chunk came from (for filtering)
+    #   - "chunk_index": the position of this chunk within the document
+    #                    (useful for ordering results or debugging)
+    #
+    # This metadata is not used for similarity search, but can be used to
+    # filter results: "only search chunks from document X".
+
+    metadatas=[{"docID": docID, "chunkIndex": i} for i,_ in enumerate(chunks)]
+
+    #Step 5: Build IDs
+    # Every item in ChromaDB needs a unique string ID.
+    # We construct IDs as "doc_id__chunk_0", "doc_id__chunk_1", etc.
+    # The double underscore (__) is a common separator convention — it's unlikely
+    # to appear in a normal document name, reducing collision risk.
+    #
+    # These IDs serve two purposes:
+    #   1. ChromaDB uses them as primary keys (no duplicates)
+    #   2. We can use them to delete all chunks for a specific doc later:
+    #      collection.delete(where={"doc_id": doc_id})
+
+    ids = [f"{docID}__chunk_{i}" for i in range(len(chunks))]
+
+    # ── Step 6: Store in ChromaDB ─────────────────────────────────────────────
+    # collection.add() stores everything in one batch call.
+    # ChromaDB writes to disk automatically (because we used PersistentClient).
+    #
+    # IMPORTANT: If the same doc_id is uploaded twice, these IDs will collide.
+    # ChromaDB will raise an error. The production fix is to first delete existing
+    # chunks for this doc_id before re-adding. For now, we keep it simple.
+    print("[ingest] Storing in ChromaDB...")
+    collection.add(ids=ids, documents=chunks,embeddings=embeddings,metadatas=metadatas,)
+    print(f"[ingest] Done. Stored {len(chunks)} chunks for doc '{docID}'.")
+
+    # Return a summary dict. FastAPI will serialize this to JSON and send it
+    # back to the frontend as the response to the upload request.
+    return {
+        "docID": docID,
+        "chunksStored": len(chunks),
+        "status": "success",
+    }
