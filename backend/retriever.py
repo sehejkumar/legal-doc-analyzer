@@ -43,13 +43,13 @@ def retrieveRelevantChunks(query: str, docID: str, nResults: int=4) -> list[str]
     chunks from a specific document.
 
     PARAMETERS:
-      query    : str  →  the user's question in plain English
-      docID    : str  →  which document to search within
-      nResults : int  →  how many chunks to return (default 4)
+        query    : str  →  the user's question in plain English
+        docID    : str  →  which document to search within
+        nResults : int  →  how many chunks to return (default 4)
 
     RETURNS:
-      A list of strings — the raw text of the most relevant chunks.
-      These will be injected into the LLM prompt.
+        A list of strings — the raw text of the most relevant chunks.
+        These will be injected into the LLM prompt.
     '''
     #Step 1: Embed the query
     # Convert the question into the same 384-dim vector space the chunks live in.
@@ -68,7 +68,7 @@ def retrieveRelevantChunks(query: str, docID: str, nResults: int=4) -> list[str]
     # return 384 floats per chunk when we only need the text).
 
     results = collection.query(
-        query_embeddings=queryVector,
+        query_embeddings=[queryVector],
         n_results=nResults,
         where={"docID": docID},
         include=["documents", "distances"],

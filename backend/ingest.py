@@ -196,13 +196,13 @@ def ingestPDF (filePath: str, docID: str) -> dict:
     This is the function that FastAPI will call when a user uploads a PDF.
 
     PARAMETERS:
-      filePath : str  →  path to the saved PDF on disk
-      docID    : str  →  a unique identifier for this document
-                          (we'll use the filename, e.g. "contract_2024.pdf")
-                          Used to namespace chunks so we can delete or filter
-                          by document later.
+        filePath : str  →  path to the saved PDF on disk
+        docID    : str  →  a unique identifier for this document
+                            (we'll use the filename, e.g. "contract_2024.pdf")
+                            Used to namespace chunks so we can delete or filter
+                            by document later.
     RETURNS:
-      A dict with metadata about what was ingested (useful for API responses).
+        A dict with metadata about what was ingested (useful for API responses).
     """
 
     #Step 1: Extract
@@ -227,10 +227,10 @@ def ingestPDF (filePath: str, docID: str) -> dict:
     # (num_chunks, 384). Each row is the 384-dimensional embedding for one chunk.
     # show_progress_bar=True prints a tqdm progress bar to the terminal.
     # For a large document with 100+ chunks, this gives you visibility.
-     # convert_to_list=True converts the numpy array to a plain Python list.
+    # convert_to_list=True converts the numpy array to a plain Python list.
     # ChromaDB expects Python lists, not numpy arrays.
     print("[ingest] Generating embeddings...")
-    embeddings = model.encode(chunks,show_progress_bar=True, convert_to_list=True)
+    embeddings = model.encode(chunks,show_progress_bar=True).tolist()
 
     #Step 4: Build metadata
     # ChromaDB lets you attach arbitrary metadata to each stored item.
