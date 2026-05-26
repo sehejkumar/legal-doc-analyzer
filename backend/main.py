@@ -15,6 +15,15 @@
 #   (--reload restarts the server automatically when you save any .py file)
 # ─────────────────────────────────────────────────────────────────────────────
 
+# ─────────────────────────────────────────────────────────────────────────────
+# CHANGES FROM V1:
+#   - AskRequest now includes history: list[dict] for conversation memory
+#   - /ask endpoint passes history + chunk metadata to llm.stream_response()
+#   - /ask now streams source metadata FIRST, then the text response
+#   - New endpoint: DELETE /documents/{doc_id}
+# ─────────────────────────────────────────────────────────────────────────────
+
+import json
 import os
 import shutil
 
@@ -24,7 +33,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from ingest import ingestPDF
-from retriever import retrieveRelevantChunks, listIndexedDocuments
+from retriever import retrieveRelevantChunks, listIndexedDocuments, deleteDocument
 from llm import streamResponse
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -40,7 +49,7 @@ from llm import streamResponse
 app = FastAPI(
     title="Legal Document Analyzer",
     description="Upload a legal PDF and ask questions about it using RAG",
-    version="1.0.0",
+    version="2.0.0",
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -124,6 +133,19 @@ os.makedirs(UPLOAD_DIRECTORY, exist_ok=True)
 # This replaces manually doing: data = request.json(); query = data["query"]
 # with automatic parsing, validation, and documentation.
 
+class MessageItem(BaseModel):
+    """
+    Represents one message in the conversation history.
+    Matches the {role, content} shape the Groq API expects.
+ 
+    WHY A SEPARATE MODEL:
+    Pydantic validates nested objects too. By defining MessageItem separately,
+    FastAPI validates that every item in the history list has exactly these
+    two fields with the correct types — not just that history is a list.
+    """
+    role: str   # "user" or "assistant"
+    content: str    # the message text
+
 class AskRequest(BaseModel):
     '''
     Request body for POST /ask.
@@ -133,8 +155,19 @@ class AskRequest(BaseModel):
       docID  : str  →  which document to search (must match a previously
                         uploaded document's filename)
     '''
+    """
+    CHANGES FROM V1:
+    Added history field — the full prior conversation turns.
+ 
+    history is Optional with a default of [] (empty list).
+    This means:
+      - First message in a conversation: history=[] or omit history entirely
+      - Subsequent messages: history=[all prior {role,content} turns]
+      - Backwards compatible: old clients not sending history still work
+    """
     query: str
     docID: str
+    history: list[MessageItem] = []
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SECTION 5: Routes (endpoints)
@@ -163,7 +196,7 @@ def healthCheck():
 
     Try it: http://localhost:8000/
     '''
-    return {"status": "ok", "message": "Legal Document Analyzer API is running."}
+    return {"status": "ok", "message": "Legal Document Analyzer API v2 is running."}
 
 #Route 2: List indexed documents
 
@@ -295,6 +328,36 @@ def askQuestion(request: AskRequest):
     An HTTP 200 response with a streaming body of plain text tokens.
     """
 
+    """
+    CHANGES FROM V1:
+    1. Passes request.history to stream_response() for conversation memory.
+    2. Streams source metadata as the FIRST chunk before text tokens.
+       This lets the frontend know which chunks were used immediately,
+       display source chips before the answer starts streaming in.
+ 
+    HOW THE STREAMING PROTOCOL WORKS NOW:
+    The response stream has two phases:
+ 
+    Phase 1 — metadata (one JSON line):
+      {"sources": [{"chunk_index": 4, "doc_id": "contract.pdf"}, ...]}
+ 
+    Phase 2 — text tokens (many small strings):
+      "According" " to" " Excerpt" " 2" "," " the" " termination" ...
+ 
+    The frontend reads the first line as JSON to get sources, then treats
+    everything after as streaming text to append to the message.
+ 
+    WHY SEND METADATA FIRST (not last):
+    If we sent metadata after the text, the frontend would need to buffer
+    the entire response before knowing the sources — defeating streaming.
+    Sending it first means source chips appear immediately, then text flows in.
+ 
+    WHY USE A GENERATOR WRAPPER:
+    StreamingResponse needs a single generator. We create a wrapper generator
+    that first yields the metadata JSON line, then yields all text tokens
+    from stream_response(). One clean stream, two logical phases.
+    """
+
     # ── Validate the doc_id exists ────────────────────────────────────────────
     # Before running expensive embedding and LLM calls, verify the requested
     # document actually exists in ChromaDB. If the user passes a doc_id that
@@ -321,6 +384,33 @@ def askQuestion(request: AskRequest):
         docID=request.docID,
     )
 
+    # Convert Pydantic MessageItem objects to plain dicts for llm.py
+    # Pydantic models need .model_dump() to become plain Python dicts.
+    # llm.py expects List[dict], not List[MessageItem].
+    historyDicts = [message.model_dump() for message in request.history]
+
+    def responseGenerator():
+        """
+        A generator that yields:
+          1. One JSON line with source metadata
+          2. All streaming text tokens from the LLM
+ 
+        The \n at the end of the metadata line is the delimiter.
+        The frontend splits on the first \n to separate metadata from text.
+        """
+        # Phase 1: send sources as JSON
+        # Extract just chunk_index and doc_id — that's all the frontend needs
+        sources = [
+            {"chunkIndex": c["chunkIndex"], "docID": c["docID"]} for c in relevantChunks
+        ]
+
+        # json.dumps converts the Python dict to a JSON string.
+        # \n is the delimiter — the frontend reads until the first newline
+        # to get the metadata, then treats everything after as streaming text.
+        yield json.dumps({"sources": sources}) + "\n"
+        #Phase 2: stream LLm response tokens
+        yield from streamResponse(request.query, relevantChunks,historyDicts)
+
     # ── Stream the LLM response ───────────────────────────────────────────────
     # stream_response() from llm.py is a generator that:
     #   1. Builds the grounded prompt (system + context + user question)
@@ -335,6 +425,38 @@ def askQuestion(request: AskRequest):
     #   while (true) { const { value, done } = await reader.read(); ... }
 
     return StreamingResponse(
-        streamResponse(request.query,relevantChunks),
+        responseGenerator(),
         media_type="text/plain"
     )
+
+#Route 5: Delete all chunks for a document
+@app.delete("/document/{docID}")
+def deleteDoc(docID: str):
+    """
+    Deletes all indexed chunks for a document from ChromaDB.
+ 
+    WHY DELETE VERB AND PATH PARAMETER:
+    REST convention: the resource is /documents/{doc_id}.
+    DELETE method on a resource URL = delete that resource.
+    Path parameters ({doc_id}) are used for resource identifiers in REST.
+    Query parameters (?doc_id=...) are for filtering, not identification.
+ 
+    This is a RESTful design decision worth explaining in interviews:
+    "I used DELETE /documents/{doc_id} rather than POST /delete because
+    REST maps HTTP verbs to CRUD operations — DELETE is semantically correct
+    and makes the API self-documenting."
+ 
+    IMPORTANT — URL ENCODING:
+    doc_id values are filenames like "my contract.pdf". Spaces and special
+    characters must be URL-encoded by the client: "my%20contract.pdf".
+    FastAPI automatically URL-decodes path parameters before passing them
+    to this function, so we receive the original filename.
+    """
+    try:
+        res = deleteDocument(docID)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    return res

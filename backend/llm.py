@@ -13,6 +13,14 @@
 #                           → FastAPI streams these to the frontend
 # ─────────────────────────────────────────────────────────────────────────────
 
+# ─────────────────────────────────────────────────────────────────────────────
+# CHANGES FROM V1:
+#   - build_prompt() now accepts history: list[dict] for conversation memory
+#   - Chunks are now List[dict] (with text + metadata) not List[str]
+#   - Prompt annotates each excerpt with its chunk_index for source tracing
+#   - stream_response() and get_response() both accept history parameter
+# ─────────────────────────────────────────────────────────────────────────────
+
 import os
 from groq import Groq
 from dotenv import load_dotenv
@@ -61,39 +69,45 @@ MODEL = "llama-3.3-70b-versatile"
 # SECTION 2: Prompt assembly
 # ─────────────────────────────────────────────────────────────────────────────
 
-def buildPrompt(query: str, chunks: list[str])->list[dict]:
+def buildPrompt(query: str, chunks: list[str], history: list[dict] | None = None)->list[dict]:
     '''
-    Assembles the retrieved chunks and user query into a structured message
-    list for the Groq API.
-
-    WHAT "MESSAGES" ARE:
-    The Groq/OpenAI API doesn't take a single string — it takes a list of
-    message objects, each with a "role" and "content". The roles are:
-      - "system"    : instructions to the model about how to behave
-      - "user"      : the human's message
-      - "assistant" : the model's previous responses (for multi-turn chat)
-    This structure lets the API handle conversation history naturally.
-    For now we only have system + user (single turn). In Phase 5 we'll add
-    conversation history for multi-turn chat.
-
-    WHAT THE SYSTEM PROMPT DOES:
-    The system prompt is the most important part of a RAG implementation.
-    It does three things:
-      1. Defines the model's persona ("legal document assistant")
-      2. Provides the retrieved context (the chunks)
-      3. Gives strict grounding instructions ("only use the context below")
+    Assembles the full messages array including conversation history.
  
-    Without grounding instruction #3, the model will freely mix its training
-    knowledge with the document content — which looks helpful but is actually
-    dangerous for legal use cases because the model might "fill in" plausible
-    but incorrect legal details from its training data.
-
+    PARAMETER CHANGES (v1 → v2):
+      chunks  : List[str]  →  List[dict]  (now includes metadata)
+      history : NEW        →  List[dict]  prior {role, content} messages
+ 
+    HOW CONVERSATION MEMORY WORKS:
+    The Groq/OpenAI API is stateless — it remembers nothing between calls.
+    Every call is independent. To simulate memory, we send the entire
+    conversation history on every request:
+ 
+      Call 1: [system, user_q1]                         → assistant_a1
+      Call 2: [system, user_q1, assistant_a1, user_q2]  → assistant_a2
+      Call 3: [system, user_q1, a1, user_q2, a2, user_q3] → assistant_a3
+ 
+    The model reads the full thread and can reference earlier exchanges.
+    This is exactly how ChatGPT works — there's no special memory mechanism,
+    just a growing messages array sent fresh on every request.
+ 
+    CONTEXT WINDOW CONSIDERATION:
+    Llama 3.3 70B supports 128k tokens. A typical legal Q&A conversation
+    is 2-5k tokens total. We have enormous headroom. For very long
+    conversations (50+ exchanges), you'd want to truncate older history,
+    but for this use case it's a non-issue.
+ 
+    WHY history IS Optional (None default):
+    Makes the function backwards-compatible and useful for testing — you
+    can call it without history and it still works fine.
+ 
     PARAMETERS:
-      query  : str       →  the user's question
-      chunks : List[str] →  retrieved text chunks from retriever.py
+      query   : str        →  current user question
+      chunks  : List[dict] →  retrieved chunks with text + metadata
+      history : List[dict] →  prior messages [{role, content}, ...]
+                              should NOT include the current query
  
     RETURNS:
-      List[dict] — the messages array ready to send to the API
+      List[dict] — full messages array ready for the API
     '''
 
     #Build the context block
@@ -107,7 +121,8 @@ def buildPrompt(query: str, chunks: list[str])->list[dict]:
 
     contextParts = []
     for i, currChunk in enumerate(chunks,start=1):
-        contextParts.append(f"[Excerpt {i}]\n{currChunk}")
+        header = f"[Excerpt {i} - Chunk {currChunk['chunkIndex']}]"
+        contextParts.append(f"{header}\n{currChunk}")
 
     context = "\n\n---\n\n".join(contextParts)
 
@@ -138,34 +153,35 @@ def buildPrompt(query: str, chunks: list[str])->list[dict]:
     #    message. System prompt context tends to get stronger adherence because
     #    the model treats system instructions as higher priority than user input.
 
-    systemPrompt =f"""You are a precise legal document assistant. Your job is to answer questions about the legal document the user has uploaded.
-        
-        RULES YOU MUST FOLLOW:
-        1. ONLY use the document excerpts provided below to answer questions.
-        2. Do NOT use any outside knowledge, even if you are confident in it.
-        3. If the answer cannot be found in the excerpts, say: "I could not find information about this in the provided document."
-        4. When you answer, cite which excerpt(s) you used (e.g. "According to Excerpt 2...").
-        5. Be concise and precise. Avoid unnecessary hedging or filler language.
-        6. If a question requires a legal opinion (not just facts from the document), clarify that you can only relay what the document states, not provide legal advice.
-        
-        DOCUMENT EXCERPTS:
-        {context}"""
+    # CHANGE from v1: added instruction to cite the chunk number specifically.
+    # This ties the model's citation to the metadata we're surfacing in the UI.
+
+    systemPrompt = f"""You are a precise legal document assistant. Your job is to answer questions about the legal document the user has uploaded.
+ 
+RULES YOU MUST FOLLOW:
+1. ONLY use the document excerpts provided below to answer questions.
+2. Do NOT use any outside knowledge, even if you are confident in it.
+3. If the answer cannot be found in the excerpts, say: "I could not find information about this in the provided document."
+4. When you answer, cite which excerpt(s) you used (e.g. "According to Excerpt 2...").
+5. Be concise and precise. Avoid unnecessary hedging or filler language.
+6. If a question requires a legal opinion, clarify you can only relay what the document states.
+7. You have access to the conversation history. You may reference earlier questions and answers.
+ 
+DOCUMENT EXCERPTS:
+{context}"""
     
     #Assemble the messages list
     # The API receives a list of message dicts. Order matters:
     # system always comes first, then the conversation history, then the latest
     # user message. The model reads them top to bottom like a conversation log.
 
-    messages = [
-        {
-            "role": "system",
-            "content": systemPrompt,
-        },
-        {
-            "role": "user",
-            "content": query,
-        },
-    ]
+    messages = [{"role": "system", "content": systemPrompt}]
+    #Add history if present - these are the prior turns
+    if history:
+        messages.extend(history)
+
+    #Current question is always the final message
+    messages.append({"role": "user", "content": query})
 
     return messages
 
@@ -174,7 +190,7 @@ def buildPrompt(query: str, chunks: list[str])->list[dict]:
 # SECTION 3: LLM call with streaming
 # ─────────────────────────────────────────────────────────────────────────────
 
-def streamResponse(query: str, chunks: list[str]) -> Generator[str,None, None]:
+def streamResponse(query: str, chunks: list[str], history: list[dict] | None = None) -> Generator[str,None, None]:
     '''
     Builds the prompt, calls Groq with streaming enabled, and yields
     text tokens one by one as they arrive from the API.
@@ -191,6 +207,9 @@ def streamResponse(query: str, chunks: list[str]) -> Generator[str,None, None]:
     they arrive and immediately forward them to the browser, creating the
     real-time typewriter effect. This is called Server-Sent Events (SSE) or
     HTTP streaming.
+
+    CHANGE from v1: added history parameter, passed through to build_prompt().
+    Everything else identical.
  
     The alternative (waiting for the full response) would mean:
       - User sees nothing for 5-15 seconds
@@ -209,7 +228,7 @@ def streamResponse(query: str, chunks: list[str]) -> Generator[str,None, None]:
     '''
 
     #Build the structured messages list
-    messages = buildPrompt(query, chunks)
+    messages = buildPrompt(query, chunks, history)
 
     #Call the Groq API with stream=True
     # client.chat.completions.create() is the standard OpenAI-compatible call.
@@ -282,7 +301,7 @@ def streamResponse(query: str, chunks: list[str]) -> Generator[str,None, None]:
 # SECTION 4: Non-streaming version (useful for testing)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def getResponse(query: str, chunks:list[str]) ->str:
+def getResponse(query: str, chunks:list[str], history: list[dict] | None = None) ->str:
     '''
     Non-streaming version of the LLM call. Returns the complete response
     as a single string.
@@ -304,7 +323,7 @@ def getResponse(query: str, chunks:list[str]) ->str:
     In production you'd use stream_response() for the actual API endpoint.
     '''
 
-    messages = buildPrompt(query,chunks)
+    messages = buildPrompt(query,chunks, history)
 
     completion = client.chat.completions.create(
         model = MODEL,
