@@ -36,7 +36,7 @@ os.makedirs(UPLOAD_DIRECTORY, exist_ok=True)
 # Middleware runs sequentially on all incoming requests and outgoing responses.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],  # Restrict to the local development server origin
+    allow_origins=["http://localhost:5173", "https://legal-doc-analyzer.vercel.app"],  # Restrict to the local development server origin
     allow_credentials=True,                   # Maintain support for session cookies/tokens if added
     allow_methods=["*"],                      # Expose all HTTP routing verbs (GET, POST, DELETE, etc.)
     allow_headers=["*"],                      # Allow arbitrary header injection (e.g., Auth, Content-Type)
