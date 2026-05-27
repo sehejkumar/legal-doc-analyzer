@@ -48,7 +48,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Baking the ~90MB neural network payload straight into the image layers avoids runtime download
 # bottlenecks that would otherwise trip cloud provider platform health check limits.
 RUN python -c "from sentence_transformers import SentenceTransformer; \
-    SentenceTransformer('all-MiniLM-L3-v2')"
+    SentenceTransformer('paraphrase-MiniLM-L3-v2')"
 
 
 # -----------------------------------------------------------------------------
