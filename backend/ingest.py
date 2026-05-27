@@ -1,25 +1,25 @@
 # ingest.py
 
-import os
 import pdfplumber
 import chromadb
-from groq import Groq
+from sentence_transformers import SentenceTransformer
 
 # -----------------------------------------------------------------------------
 # Initialization & Setup
 # -----------------------------------------------------------------------------
 
-# Initialize the Groq cloud client. This offloads the embedding calculations
-# to Groq's hardware, keeping our local Render container's RAM usage ultra-low.
-groq_client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+# Load the embedding model globally at startup to avoid reloading it on every API call.
+# The 384-dimensional all-MiniLM-L6-v2 model strikes a good balance between CPU performance 
+# and accuracy for sentence-level semantic representations.
+model = SentenceTransformer('all-MiniLM-L6-v2')
 
 # Using a persistent client instead of an ephemeral one to ensure data survives 
 # application restarts. Data is written directly to the local directory.
-chroma_client = chromadb.PersistentClient(path="./chroma_db")
+client = chromadb.PersistentClient(path="./chroma_db")
 
 # Use a single collection for document tracking. get_or_create prevents duplication 
 # errors when re-running the application.
-collection = chroma_client.get_or_create_collection("documents")
+collection = client.get_or_create_collection("documents")
 
 
 # -----------------------------------------------------------------------------
@@ -29,10 +29,6 @@ collection = chroma_client.get_or_create_collection("documents")
 def extractTextFromPDF(file_path: str) -> str:
     """
     Extracts text from an on-disk PDF file and aggregates it into a single string.
-
-    Design Choice:
-    pdfplumber handles multi-column layouts and nested tables without breaking 
-    the reading order. This is critical for preserving document context prior to chunking.
     """
     allText = []
 
@@ -53,7 +49,6 @@ def extractTextFromPDF(file_path: str) -> str:
 def chunkText(text: str, chunkSize: int = 500, overlap: int = 50) -> list[str]:
     """
     Splits a raw text string into a list of smaller, overlapping word blocks.
-    An overlap is maintained to ensure context is preserved across transitions.
     """
     words = text.split()
     chunks = []
@@ -75,8 +70,7 @@ def chunkText(text: str, chunkSize: int = 500, overlap: int = 50) -> list[str]:
 
 def ingestPDF(filePath: str, docID: str) -> dict:
     """
-    Executes the ingestion pipeline: reads a PDF, chunks the text, 
-    generates cloud vector embeddings via Groq, and registers the payload in ChromaDB.
+    Executes the ingestion pipeline locally using the SentenceTransformer model weights.
     """
     print(f"[ingest] Extracting text from {filePath}...")
     text = extractTextFromPDF(filePath)
@@ -84,28 +78,15 @@ def ingestPDF(filePath: str, docID: str) -> dict:
     if not text.strip():
         raise ValueError(
             "No text could be extracted from this PDF. "
-            "It may be a scanned document without a text layer. "
-            "OCR support is not yet implemented."
+            "It may be a scanned document without a text layer."
         )
     
     print("[ingest] Chunking text...")
     chunks = chunkText(text)
     print(f"[ingest] Created {len(chunks)} chunks.")
 
-    print("[ingest] Generating embeddings via Groq Cloud API...")
-    embeddings = []
-    
-    # Send each text chunk to Groq's high-speed embedding API.
-    for chunk in chunks:
-        # Replacing newlines minimizes formatting layout noise inside the text embedding vectors
-        cleaned_text = chunk.replace("\n", " ")
-        
-        response = groq_client.embeddings.create(
-            model="nomic-embed-text-v1.5",
-            input=cleaned_text
-        )
-        # Extract the array of vector floats
-        embeddings.append(response.data[0].embedding)
+    print("[ingest] Generating local embeddings...")
+    embeddings = model.encode(chunks, show_progress_bar=True).tolist()
 
     # Create isolation filtering scopes and tracking indexes
     metadatas = [{"docID": docID, "chunkIndex": i} for i, _ in enumerate(chunks)]

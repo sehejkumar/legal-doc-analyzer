@@ -1,20 +1,19 @@
 # retriever.py
 
-import os
 import chromadb
-from groq import Groq
+from sentence_transformers import SentenceTransformer
 
 # -----------------------------------------------------------------------------
 # Shared Instances & Configuration
 # -----------------------------------------------------------------------------
 
-# Initialize the Groq cloud client. Must use the exact same embedding model
-# used during ingestion to ensure geometric vector calculations align correctly.
-groq_client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+# Must use the exact same embedding model used during ingestion to ensure 
+# vector comparisons occur within the identical geometric vector space.
+model = SentenceTransformer('all-MiniLM-L6-v2')
 
 # Point to the existing database directory initialized by ingest.py
-chroma_client = chromadb.PersistentClient(path="./chroma_db")
-collection = chroma_client.get_or_create_collection("documents")
+client = chromadb.PersistentClient(path="./chroma_db")
+collection = client.get_or_create_collection("documents")
 
 
 # -----------------------------------------------------------------------------
@@ -23,16 +22,11 @@ collection = chroma_client.get_or_create_collection("documents")
 
 def retrieveRelevantChunks(query: str, docID: str, nResults: int = 4) -> list[dict]:
     """
-    Embeds an incoming user query via Groq cloud API and fetches the top-N 
-    semantically similar chunks restricted to a specific document.
+    Embeds an incoming user query and fetches the top-N semantically similar 
+    chunks restricted to a specific document.
     """
-    # Vectorize the text query string using the cloud model
-    cleaned_query = query.replace("\n", " ")
-    response = groq_client.embeddings.create(
-        model="nomic-embed-text-v1.5",
-        input=cleaned_query
-    )
-    queryVector = response.data[0].embedding
+    # Vectorize the text query to match the shape of the stored document vectors
+    queryVector = model.encode(query).tolist()
 
     # Query ChromaDB. We use metadata filtering (where=) to avoid cross-document 
     # leakage, and explicitly ask for "metadatas" to recover the chunk positions.
@@ -43,12 +37,11 @@ def retrieveRelevantChunks(query: str, docID: str, nResults: int = 4) -> list[di
         include=["documents", "distances", "metadatas"],
     )
 
-    # Unpack the initial array wrapper (ChromaDB structures responses for batch inputs)
+    # Unpack the initial array wrapper
     chunksText = results["documents"][0]
     distances = results["distances"][0]
     metadatas = results["metadatas"][0]
 
-    # Console logging for tracking semantic match quality during development.
     print(f"[Retriever] Query: '{query[:60]}...")
     for i, (currChunk, currDist, currMeta) in enumerate(zip(chunksText, distances, metadatas)):
         preview = currChunk[:80].replace("\n", " ")
@@ -73,16 +66,9 @@ def retrieveRelevantChunks(query: str, docID: str, nResults: int = 4) -> list[di
 def listIndexedDocuments() -> list[str]:
     """
     Scans the collection metadata to identify all unique documents indexed.
-    Queries only the metadata field to optimize memory allocation performance.
     """
     allItems = collection.get(include=["metadatas"])
-    
-    # Extract unique identifiers using a set lookup
-    docIDs = sorted(set(
-        meta["docID"]
-        for meta in allItems["metadatas"]
-    ))
-
+    docIDs = sorted(set(meta["docID"] for meta in allItems["metadatas"]))
     return docIDs
 
 
@@ -94,7 +80,6 @@ def deleteDocument(docID: str) -> dict:
     if docID not in indexedDoc:
         raise ValueError(f"Document '{docID}' not found in index.")
     
-    # Target and wipe elements bound to the requested metadata scope
     collection.delete(where={"docID": docID})
     print(f"[Retriever] Deleted all chunks for doc '{docID}'.")
     
