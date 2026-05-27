@@ -1,92 +1,48 @@
-#retriever.py
-# ─────────────────────────────────────────────────────────────────────────────
-# PURPOSE: Given a user's question, find the most semantically relevant chunks
-#          from the document that was previously indexed by ingest.py.
-#
-# This is the "Retrieval" step in Retrieval-Augmented Generation.
-# It runs on EVERY user message, before the LLM is called.
-#
-# Data flow:
-#   user question (string)
-#       → embed question → query vector (384 numbers)
-#       → ChromaDB cosine similarity search
-#       → top-k most relevant chunks (strings)
-#       → returned to llm.py which builds the prompt
-# ─────────────────────────────────────────────────────────────────────────────
+# retriever.py
 
 import chromadb
 from sentence_transformers import SentenceTransformer
 
-# ─────────────────────────────────────────────────────────────────────────────
-# SECTION 1: Shared instances
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
+# Shared Instances & Configuration
+# -----------------------------------------------------------------------------
 
-# Both ingest.py and retriever.py use the same model name. Python's import
-# system caches modules so the model is only loaded into RAM once.
-# CRITICAL: must be the same model as ingest.py — vectors are only comparable
-# within the same model's geometric space.
-
+# Must use the exact same embedding model used during ingestion to ensure 
+# vector comparisons occur within the identical geometric vector space.
 model = SentenceTransformer("all-MiniLM-L6-v2")
 
-# Connects to the existing chroma_db folder that ingest.py already populated.
-# We are NOT creating a new database — just getting a handle to query it.
+# Point to the existing database directory initialized by ingest.py
 client = chromadb.PersistentClient(path="./chroma_db")
 collection = client.get_or_create_collection("documents")
 
-# ─────────────────────────────────────────────────────────────────────────────
-# SECTION 2: The retrieval function
-# ─────────────────────────────────────────────────────────────────────────────
 
-def retrieveRelevantChunks(query: str, docID: str, nResults: int=4) -> list[dict]:
+# -----------------------------------------------------------------------------
+# Core Retrieval
+# -----------------------------------------------------------------------------
+
+def retrieveRelevantChunks(query: str, docID: str, nResults: int = 4) -> list[dict]:
     """
-    Embeds a user query and returns the n most semantically similar chunks
-    from a specific document — now including source metadata.
+    Embeds a incoming user query and fetches the top-N semantically similar 
+    chunks restricted to a specific document.
 
-    RETURN FORMAT CHANGE (v1 → v2):
-    v1 returned:  ["chunk text 1", "chunk text 2", ...]
-    v2 returns:   [
-                    { "text": "chunk text 1", "chunk_index": 4, "doc_id": "contract.pdf" },
-                    { "text": "chunk text 2", "chunk_index": 11, "doc_id": "contract.pdf" },
-                    ...
-                    ]
+    Design Choice:
+    Returns a dictionary list containing both text and metadata rather than plain 
+    strings. This encapsulates the text alongside its positional context (chunkIndex) 
+    so the UI can map and highlight exactly where the answer resides in the document.
 
-    WHY RETURN DICTS INSTEAD OF PLAIN STRINGS:
-    The source highlighting feature needs to show the user WHERE in the document
-    each answer came from. chunk_index tells us which numbered chunk it was.
-    By bundling text + metadata together in one object, callers don't need to
-    manage two parallel lists — everything travels together.
-    This is the "keep related data together" principle from data modelling.
+    Parameters:
+        query (str): The search query or question from the user.
+        docID (str): The document identifier to restrict the search scope.
+        nResults (int): Maximum number of matching chunks to return. Default is 4.
 
-    PARAMETERS:
-        query     : str  →  the user's question
-        doc_id    : str  →  which document to search within
-        n_results : int  →  how many chunks to return (default 4)
-
-    RETURNS:
-        List[dict] with keys: text, chunk_index, doc_id
+    Returns:
+        list[dict]: Chunks containing keys: 'text', 'chunkIndex', and 'docID'.
     """
-    #Step 1: Embed the query
-    # Convert the question into the same 384-dim vector space the chunks live in.
-    # .tolist() converts numpy array → plain Python list (what ChromaDB expects).
+    # Vectorize the text query to match the shape of the stored document vectors
     queryVector = model.encode(query).tolist()
 
-    #Step 2: Query ChromaDB
-    # query_embeddings expects List[List[float]] — double-nested — because
-    # ChromaDB supports batch queries. Single query still needs outer list: [vec].
-
-    # where={"doc_id": doc_id} is metadata filtering — scopes the search to
-    # only chunks from this specific document. Without it, all indexed documents
-    # would be searched and results would bleed across documents.
-
-    # include= limits what gets returned. We skip embeddings (wasteful to
-    # return 384 floats per chunk when we only need the text).
-
-    # CHANGE: added "metadatas" to include= so we get chunk_index back
-    # Previously: include=["documents", "distances"]
-    # Now:        include=["documents", "distances", "metadatas"]
-    # Metadatas contains the dict we stored during ingest:
-    # {"doc_id": "contract.pdf", "chunk_index": 4}
-
+    # Query ChromaDB. We use metadata filtering (where=) to avoid cross-document 
+    # leakage, and explicitly ask for "metadatas" to recover the chunk positions.
     results = collection.query(
         query_embeddings=[queryVector],
         n_results=nResults,
@@ -94,32 +50,19 @@ def retrieveRelevantChunks(query: str, docID: str, nResults: int=4) -> list[dict
         include=["documents", "distances", "metadatas"],
     )
 
-    #Step 3: Unpack results
-    # results["documents"] is List[List[str]] — double nested because ChromaDB
-    # supports batch queries. [0] gets the results for our single query.
+    # Unpack the initial array wrapper (ChromaDB structures responses for batch inputs)
+    chunksText = results["documents"][0]
+    distances = results["distances"][0]
+    metadatas = results["metadatas"][0]
 
-    # distances are cosine DISTANCE (not similarity): distance = 1 - similarity
-    # Lower = better match. Results are already sorted best-first.
-
-    chunksText = results["documents"][0] #List[str]
-    distances = results["distances"][0] #List[float]
-    metadatas = results["metadatas"][0] #List[dict]
-
-    #Step 4: Debug Logging
-    # Print distances during dev to verify retrieval quality.
-    # < 0.3 = strong match, 0.3-0.6 = moderate, > 0.7 = poor retrieval.
-    # Most RAG failures are retrieval failures — monitor this closely.
-
+    # Console logging for tracking semantic match quality during development.
+    # Cosine distance metrics: < 0.3 is optimal, > 0.6 indicates poor alignment.
     print(f"[Retriever] Query: '{query[:60]}...")
     for i, (currChunk, currDist, currMeta) in enumerate(zip(chunksText, distances, metadatas)):
         preview = currChunk[:80].replace("\n", " ")
         print(f" [{i+1}] distance={currDist:.3f} | chunk={currMeta['chunkIndex']} | {preview}...")
     
-    # Zip the three parallel lists into a list of dicts.
-    # zip() takes multiple iterables and yields tuples: (text, dist, meta)
-    # We only include text and metadata in the output — distance is for
-    # internal logging only, not exposed to the LLM or frontend.
-
+    # Map the arrays back to structured dictionaries for consumers
     chunks = [
         {
             "text": currChunk,
@@ -130,22 +73,25 @@ def retrieveRelevantChunks(query: str, docID: str, nResults: int=4) -> list[dict
     ]
     return chunks
 
-# ─────────────────────────────────────────────────────────────────────────────
-# SECTION 3: Utility — list all indexed documents
-# ─────────────────────────────────────────────────────────────────────────────
+
+# -----------------------------------------------------------------------------
+# Management Utilities
+# -----------------------------------------------------------------------------
 
 def listIndexedDocuments() -> list[str]:
-    '''
-    Returns a list of unique doc_ids currently stored in ChromaDB.
-    Used by the frontend to populate a document selector dropdown.
-    Queries metadata only — does not fetch embeddings or chunk text.
-    '''
+    """
+    Scans the collection metadata to identify all unique documents indexed.
 
+    Design Choice:
+    Queries only the metadata field to prevent fetching large text payloads or 
+    heavy vector fields into memory, optimizing dropdown generation on the front end.
+
+    Returns:
+        list[str]: A deduplicated, sorted list of indexed document names.
+    """
     allItems = collection.get(include=["metadatas"])
-    # all_items["metadatas"] is a list of dicts:
-    # [{"docID": "contract.pdf", "chunkIndex": 0}, ...]
-    # set() deduplicates, sorted() gives consistent ordering.
-
+    
+    # Extract unique identifiers using a set lookup
     docIDs = sorted(set(
         meta["docID"]
         for meta in allItems["metadatas"]
@@ -153,32 +99,27 @@ def listIndexedDocuments() -> list[str]:
 
     return docIDs
 
+
 def deleteDocument(docID: str) -> dict:
-    '''
-    Deletes ALL chunks belonging to a specific document from ChromaDB.
-    Called by the DELETE /documents/{doc_id} endpoint in main.py.
+    """
+    Purges all vector blocks associated with a specific document identifier.
 
-    WHY THIS IS SAFE:
-    ChromaDB's .delete(where=...) uses the same metadata filter as .query().
-    It deletes only chunks where doc_id matches — other documents are untouched.
+    Design Choice:
+    Validates document existence explicitly before running the purge command 
+    to prevent false successes when an invalid payload is passed.
 
-    WHAT HAPPENS TO THE DATA:
-    ChromaDB removes the vectors, text, and metadata from its on-disk store.
-    The chroma_db/ folder shrinks. The document can be re-uploaded and
-    re-indexed from scratch at any time.
+    Parameters:
+        docID (str): Name or ID of the document targeted for removal.
 
-    RETURNS:
-        {"doc_id": doc_id, "status": "deleted"}
-    '''
-
-    # First check the document exists — better to fail with a clear message
-    # than silently delete nothing and return success.
+    Returns:
+        dict: Confirmation mapping showing the target document and deletion status.
+    """
     indexedDoc = listIndexedDocuments()
     if docID not in indexedDoc:
         raise ValueError(f"Document '{docID}' not found in index.")
     
-    # collection.delete(where=...) removes all items matching the filter.
-    # This is the same where= syntax as collection.query() — consistent API.
+    # Target and wipe elements bound to the requested metadata scope
     collection.delete(where={"docID": docID})
-    print(f"[Retriever] De;eted all chunks for doc '{docID}'.")
+    print(f"[Retriever] Deleted all chunks for doc '{docID}'.")
+    
     return {"docID": docID, "status": "deleted"}
