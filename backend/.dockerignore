@@ -1,0 +1,42 @@
+# backend/.dockerignore
+
+# -----------------------------------------------------------------------------
+# Local Environments & Workspace Packages
+# -----------------------------------------------------------------------------
+# Exclude local virtual environment paths; packages are installed fresh inside 
+# the image layers via the Dockerfile requirements stage.
+.venv/
+venv/
+
+
+# -----------------------------------------------------------------------------
+# Protected Secrets & Local Environment Variables
+# -----------------------------------------------------------------------------
+# Prevent local configuration states or secret keys from leaking into compiled images.
+.env
+
+
+# -----------------------------------------------------------------------------
+# Local Runtime Caches & Dynamic File Stores
+# -----------------------------------------------------------------------------
+# Prevent development testing stores and dynamic databases from ballooning build payloads.
+chroma_db/
+uploads/
+
+
+# -----------------------------------------------------------------------------
+# Compiled Bytecode & Framework Artifacts
+# -----------------------------------------------------------------------------
+# Strip interpreter runtime artifacts and execution history files.
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+
+
+# -----------------------------------------------------------------------------
+# Testing Caches & Operational Log Prints
+# -----------------------------------------------------------------------------
+.pytest_cache/
+*.log
