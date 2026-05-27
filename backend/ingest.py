@@ -11,7 +11,7 @@ from sentence_transformers import SentenceTransformer
 # Load the embedding model globally at startup to avoid reloading it on every API call.
 # The 384-dimensional all-MiniLM-L6-v2 model strikes a good balance between CPU performance 
 # (~20ms latency) and accuracy for sentence-level semantic representations.
-model = SentenceTransformer("all-MiniLM-L6-v2")
+model = SentenceTransformer("all-MiniLM-L3-v2")
 
 # Using a persistent client instead of an ephemeral one to ensure data survives 
 # application restarts. Data is written directly to the local directory.

@@ -9,7 +9,7 @@ from sentence_transformers import SentenceTransformer
 
 # Must use the exact same embedding model used during ingestion to ensure 
 # vector comparisons occur within the identical geometric vector space.
-model = SentenceTransformer("all-MiniLM-L6-v2")
+model = SentenceTransformer("all-MiniLM-L3-v2")
 
 # Point to the existing database directory initialized by ingest.py
 client = chromadb.PersistentClient(path="./chroma_db")
