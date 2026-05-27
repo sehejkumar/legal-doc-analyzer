@@ -1,19 +1,20 @@
 # retriever.py
 
+import os
 import chromadb
-from sentence_transformers import SentenceTransformer
+from groq import Groq
 
 # -----------------------------------------------------------------------------
 # Shared Instances & Configuration
 # -----------------------------------------------------------------------------
 
-# Must use the exact same embedding model used during ingestion to ensure 
-# vector comparisons occur within the identical geometric vector space.
-model = SentenceTransformer('paraphrase-MiniLM-L3-v2')
+# Initialize the Groq cloud client. Must use the exact same embedding model
+# used during ingestion to ensure geometric vector calculations align correctly.
+groq_client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 
 # Point to the existing database directory initialized by ingest.py
-client = chromadb.PersistentClient(path="./chroma_db")
-collection = client.get_or_create_collection("documents")
+chroma_client = chromadb.PersistentClient(path="./chroma_db")
+collection = chroma_client.get_or_create_collection("documents")
 
 
 # -----------------------------------------------------------------------------
@@ -22,24 +23,16 @@ collection = client.get_or_create_collection("documents")
 
 def retrieveRelevantChunks(query: str, docID: str, nResults: int = 4) -> list[dict]:
     """
-    Embeds a incoming user query and fetches the top-N semantically similar 
-    chunks restricted to a specific document.
-
-    Design Choice:
-    Returns a dictionary list containing both text and metadata rather than plain 
-    strings. This encapsulates the text alongside its positional context (chunkIndex) 
-    so the UI can map and highlight exactly where the answer resides in the document.
-
-    Parameters:
-        query (str): The search query or question from the user.
-        docID (str): The document identifier to restrict the search scope.
-        nResults (int): Maximum number of matching chunks to return. Default is 4.
-
-    Returns:
-        list[dict]: Chunks containing keys: 'text', 'chunkIndex', and 'docID'.
+    Embeds an incoming user query via Groq cloud API and fetches the top-N 
+    semantically similar chunks restricted to a specific document.
     """
-    # Vectorize the text query to match the shape of the stored document vectors
-    queryVector = model.encode(query).tolist()
+    # Vectorize the text query string using the cloud model
+    cleaned_query = query.replace("\n", " ")
+    response = groq_client.embeddings.create(
+        model="nomic-embed-text-v1.5",
+        input=cleaned_query
+    )
+    queryVector = response.data[0].embedding
 
     # Query ChromaDB. We use metadata filtering (where=) to avoid cross-document 
     # leakage, and explicitly ask for "metadatas" to recover the chunk positions.
@@ -56,7 +49,6 @@ def retrieveRelevantChunks(query: str, docID: str, nResults: int = 4) -> list[di
     metadatas = results["metadatas"][0]
 
     # Console logging for tracking semantic match quality during development.
-    # Cosine distance metrics: < 0.3 is optimal, > 0.6 indicates poor alignment.
     print(f"[Retriever] Query: '{query[:60]}...")
     for i, (currChunk, currDist, currMeta) in enumerate(zip(chunksText, distances, metadatas)):
         preview = currChunk[:80].replace("\n", " ")
@@ -81,13 +73,7 @@ def retrieveRelevantChunks(query: str, docID: str, nResults: int = 4) -> list[di
 def listIndexedDocuments() -> list[str]:
     """
     Scans the collection metadata to identify all unique documents indexed.
-
-    Design Choice:
-    Queries only the metadata field to prevent fetching large text payloads or 
-    heavy vector fields into memory, optimizing dropdown generation on the front end.
-
-    Returns:
-        list[str]: A deduplicated, sorted list of indexed document names.
+    Queries only the metadata field to optimize memory allocation performance.
     """
     allItems = collection.get(include=["metadatas"])
     
@@ -103,16 +89,6 @@ def listIndexedDocuments() -> list[str]:
 def deleteDocument(docID: str) -> dict:
     """
     Purges all vector blocks associated with a specific document identifier.
-
-    Design Choice:
-    Validates document existence explicitly before running the purge command 
-    to prevent false successes when an invalid payload is passed.
-
-    Parameters:
-        docID (str): Name or ID of the document targeted for removal.
-
-    Returns:
-        dict: Confirmation mapping showing the target document and deletion status.
     """
     indexedDoc = listIndexedDocuments()
     if docID not in indexedDoc:

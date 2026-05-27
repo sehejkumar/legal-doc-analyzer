@@ -1,25 +1,25 @@
 # ingest.py
 
+import os
 import pdfplumber
 import chromadb
-from sentence_transformers import SentenceTransformer
+from groq import Groq
 
 # -----------------------------------------------------------------------------
 # Initialization & Setup
 # -----------------------------------------------------------------------------
 
-# Load the embedding model globally at startup to avoid reloading it on every API call.
-# The 384-dimensional all-MiniLM-L6-v2 model strikes a good balance between CPU performance 
-# (~20ms latency) and accuracy for sentence-level semantic representations.
-model = SentenceTransformer('paraphrase-MiniLM-L3-v2')
+# Initialize the Groq cloud client. This offloads the embedding calculations
+# to Groq's hardware, keeping our local Render container's RAM usage ultra-low.
+groq_client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 
 # Using a persistent client instead of an ephemeral one to ensure data survives 
 # application restarts. Data is written directly to the local directory.
-client = chromadb.PersistentClient(path="./chroma_db")
+chroma_client = chromadb.PersistentClient(path="./chroma_db")
 
 # Use a single collection for document tracking. get_or_create prevents duplication 
 # errors when re-running the application.
-collection = client.get_or_create_collection("documents")
+collection = chroma_client.get_or_create_collection("documents")
 
 
 # -----------------------------------------------------------------------------
@@ -31,27 +31,18 @@ def extractTextFromPDF(file_path: str) -> str:
     Extracts text from an on-disk PDF file and aggregates it into a single string.
 
     Design Choice:
-    pdfplumber was selected over PyPDF2/pdfminer because it handles multi-column 
-    layouts and nested tables without breaking the reading order. This is critical 
-    for preserving document context prior to chunking.
-
-    Parameters:
-        file_path (str): Path to the target PDF file.
-
-    Returns:
-        str: All extracted text separated by double newlines to mark page boundaries.
+    pdfplumber handles multi-column layouts and nested tables without breaking 
+    the reading order. This is critical for preserving document context prior to chunking.
     """
     allText = []
 
     with pdfplumber.open(file_path) as currPDF:
         for currPage in currPDF.pages:
-            # Fall back to an empty string if a page is unreadable (e.g., an un-scanned image)
             currPageText = currPage.extract_text() or ""
             
             if currPageText.strip():
                 allText.append(currPageText.strip())
     
-    # Double newlines act as an explicit visual boundary for the chunker
     return "\n\n".join(allText)
 
 
@@ -62,20 +53,7 @@ def extractTextFromPDF(file_path: str) -> str:
 def chunkText(text: str, chunkSize: int = 500, overlap: int = 50) -> list[str]:
     """
     Splits a raw text string into a list of smaller, overlapping word blocks.
-
-    Design Choice:
-    Word-based chunking is chosen here as a straightforward, lightweight alternative 
-    to token-based chunking. It avoids tokenization overhead while preventing sentences 
-    from being split mid-word, which occurs with raw character splits. An overlap is 
-    maintained to ensure context is preserved across boundary transitions.
-
-    Parameters:
-        text (str): The raw text to break down.
-        chunkSize (int): Target word count per text slice. Default is 500.
-        overlap (int): Number of words repeated between adjacent chunks. Default is 50.
-
-    Returns:
-        list[str]: A list containing the isolated text segments.
+    An overlap is maintained to ensure context is preserved across transitions.
     """
     words = text.split()
     chunks = []
@@ -85,7 +63,6 @@ def chunkText(text: str, chunkSize: int = 500, overlap: int = 50) -> list[str]:
         chunkWords = words[i:i + chunkSize]
         chunks.append(" ".join(chunkWords))
 
-        # Break early if the window reaches or overshoots the end of the text
         if i + chunkSize >= len(words):
             break
             
@@ -99,19 +76,7 @@ def chunkText(text: str, chunkSize: int = 500, overlap: int = 50) -> list[str]:
 def ingestPDF(filePath: str, docID: str) -> dict:
     """
     Executes the ingestion pipeline: reads a PDF, chunks the text, 
-    generates vector embeddings, and registers the payload in ChromaDB.
-
-    Design Choice:
-    Metadata (docID and chunkIndex) is injected alongside the raw text. This provides 
-    a querying mechanism to narrow searches to specific files later on, and offers a 
-    clean hook for handling document deletions or overwrites.
-
-    Parameters:
-        filePath (str): Path to the uploaded document on disk.
-        docID (str): Unique identifier for the document (typically the filename).
-
-    Returns:
-        dict: Ingestion summary containing metadata and processing status.
+    generates cloud vector embeddings via Groq, and registers the payload in ChromaDB.
     """
     print(f"[ingest] Extracting text from {filePath}...")
     text = extractTextFromPDF(filePath)
@@ -127,9 +92,20 @@ def ingestPDF(filePath: str, docID: str) -> dict:
     chunks = chunkText(text)
     print(f"[ingest] Created {len(chunks)} chunks.")
 
-    print("[ingest] Generating embeddings...")
-    # convert_to_list is omitted; calling .tolist() directly handles the NumPy conversion
-    embeddings = model.encode(chunks, show_progress_bar=True).tolist()
+    print("[ingest] Generating embeddings via Groq Cloud API...")
+    embeddings = []
+    
+    # Send each text chunk to Groq's high-speed embedding API.
+    for chunk in chunks:
+        # Replacing newlines minimizes formatting layout noise inside the text embedding vectors
+        cleaned_text = chunk.replace("\n", " ")
+        
+        response = groq_client.embeddings.create(
+            model="nomic-embed-text-v1.5",
+            input=cleaned_text
+        )
+        # Extract the array of vector floats
+        embeddings.append(response.data[0].embedding)
 
     # Create isolation filtering scopes and tracking indexes
     metadatas = [{"docID": docID, "chunkIndex": i} for i, _ in enumerate(chunks)]

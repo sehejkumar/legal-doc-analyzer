@@ -47,8 +47,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Explicitly initialize and cash the embedding weights directly during the build execution phase.
 # Baking the ~90MB neural network payload straight into the image layers avoids runtime download
 # bottlenecks that would otherwise trip cloud provider platform health check limits.
-RUN python -c "from sentence_transformers import SentenceTransformer; \
-    SentenceTransformer('paraphrase-MiniLM-L3-v2')"
+
 
 
 # -----------------------------------------------------------------------------
